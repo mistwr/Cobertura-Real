@@ -917,16 +917,21 @@ function toWebMercator(lat, lon) {
 }
 
 // Main coverage query via ArcGIS identify
-// ── QUERY COBERTURA VIA PROXY VERCEL ─────────────────────────────
-// O browser chama /api/anacom → o servidor Vercel chama geo.anacom.pt
-// Sem CORS. Com cache 5min. Com fallback automático.
+// ── QUERY COBERTURA — proxy Vercel com fallback automático ──────
 async function queryCoverageArcGIS(lat, lon) {
-  const url = `${API_ANACOM}?lat=${lat}&lon=${lon}`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
-  if (!res.ok) throw new Error(`Proxy HTTP ${res.status}`);
-  const data = await res.json();
-  if (!data.ok) throw new Error(data.error || 'API error');
-  return data; // { ok, source, fixa, movel, sat }
+  // 1. Tenta proxy Vercel /api/anacom
+  try {
+    const res = await fetch(`${API_ANACOM}?lat=${lat}&lon=${lon}`,
+      { signal: AbortSignal.timeout(8000) });
+    if (res.ok) {
+      const data = await res.json();
+      if (data.ok && (data.fixa || data.movel)) return data;
+    }
+  } catch(e) { console.warn('Proxy ANACOM indisponível:', e.message); }
+
+  // 2. Fallback: dados baseados em mercado PT real (sem API)
+  console.info('Usando dados de estimativa de mercado PT');
+  return { ok:true, source:'fallback', ...generateCoverageData(lat, lon) };
 }
 
 // queryCoverageByLayer — substituído pelo proxy /api/anacom
@@ -1159,9 +1164,29 @@ async function lookupCoverage(lat, lon, addressLabel) {
     if (proxyData.fixa || proxyData.movel) {
       result = proxyData;
       // Mostrar fonte dos dados
-      const srcLabel = { identify:'GEO.ANACOM (identify)', layers:'GEO.ANACOM (layers)', fallback:'Estimativa mercado PT' };
-      document.getElementById('loc-update').textContent =
-        `Fonte: ${srcLabel[proxyData.source] || 'GEO.ANACOM'} · ANACOM Q3 2025`;
+      const srcLabel = {
+        'geo.anacom.pt': 'GEO.ANACOM oficial · Q4 2025',
+        'estimativa': 'Sem edifício ANACOM neste ponto exato',
+        'erro': 'Erro de ligação — dados estimados',
+        'identify': 'GEO.ANACOM', 'layers': 'GEO.ANACOM', 'fallback': 'Estimativa PT'
+      };
+      const srcText = srcLabel[proxyData.source] || 'GEO.ANACOM';
+      document.getElementById('loc-update').textContent = `Fonte: ${srcText}`;
+      // Mostrar aviso se sem dados exactos
+      if (proxyData.aviso) {
+        let av = document.getElementById('anacom-aviso');
+        if (!av) {
+          av = document.createElement('div');
+          av.id = 'anacom-aviso';
+          av.style.cssText = 'margin:8px 16px;padding:8px 12px;background:rgba(255,179,0,0.08);border:1px solid rgba(255,179,0,0.3);border-radius:6px;font-size:11px;color:var(--amber);line-height:1.5';
+          document.getElementById('results-content').prepend(av);
+        }
+        av.textContent = '⚠️ ' + proxyData.aviso;
+        av.style.display = 'block';
+      } else {
+        const av = document.getElementById('anacom-aviso');
+        if (av) av.style.display = 'none';
+      }
     } else {
       result = generateCoverageData(lat, lon);
     }
@@ -1280,7 +1305,18 @@ function formatSpeed(mbps) {
 function renderFixa() {
   const container = document.getElementById('fixa-list');
   if (!coverage.fixa || coverage.fixa.length === 0) {
-    container.innerHTML = '<div style="padding:20px 20px;font-size:13px;color:var(--muted)">Sem cobertura de rede fixa nesta localização.</div>';
+    container.innerHTML = `
+      <div style="padding:16px 20px">
+        <div style="font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:12px">
+          Não foram encontrados dados de rede fixa para este ponto exacto.<br>
+          <strong style="color:var(--amber)">A rede fixa ANACOM tem resolução ao nível do edifício.</strong>
+          Tenta clicar directamente sobre um edifício no mapa.
+        </div>
+        <a href="https://geo.anacom.pt/publico/home" target="_blank"
+           style="display:flex;align-items:center;gap:8px;padding:10px 12px;background:var(--card);border:1px solid var(--border2);border-radius:8px;color:var(--green);text-decoration:none;font-size:12px;font-weight:600">
+          🔗 Consultar directamente no GEO.ANACOM
+        </a>
+      </div>`;
     return;
   }
 
@@ -1519,41 +1555,76 @@ async function geocodeAddress(query) {
     // É código postal → usar geoapi.pt directamente
     return await geocodeByPostalCode(cpMatch[1] + '-' + cpMatch[2]);
   }
-  // Texto → proxy /api/moradas → Nominatim server-side
-  const r = await fetch(`${API_MORADAS}?q=${encodeURIComponent(query)}`, {
-    signal: AbortSignal.timeout(8000)
-  });
-  if (!r.ok) throw new Error('Geocode failed');
-  const d = await r.json();
-  return d.results || [];
-}
-
-// Resolução por código postal via proxy /api/moradas → geoapi.pt
-async function geocodeByPostalCode(cp) {
-  const r = await fetch(`${API_MORADAS}?cp=${encodeURIComponent(cp)}`, {
-    signal: AbortSignal.timeout(8000)
-  });
-  if (!r.ok) throw new Error('CP não encontrado');
-  const d = await r.json();
-  if (!d.ok) throw new Error(d.error || 'CP inválido');
-  const lat = parseFloat(d.latitude || d.Latitude || 0);
-  const lon = parseFloat(d.longitude || d.Longitude || 0);
-  if (!lat || !lon) throw new Error('CP sem coordenadas');
-  return [{ lat, lon, display_name: `${d.rua || d.Rua || ''}, ${d.localidade || d.Localidade || ''}, ${cp}`, _geoapi: d }];
-}
-
-// Reverse geocode via proxy /api/moradas → geoapi.pt + Nominatim server-side
-async function reverseGeocodeGeoAPI(lat, lon) {
+  // Texto → proxy Vercel, fallback directo Nominatim
   try {
-    const r = await fetch(`${API_MORADAS}?lat=${lat}&lon=${lon}`, {
-      signal: AbortSignal.timeout(8000)
-    });
-    if (!r.ok) return null;
-    const d = await r.json();
-    return d.ok ? d : null;
-  } catch {
-    return null;
-  }
+    const r = await fetch(`${API_MORADAS}?q=${encodeURIComponent(query)}`,
+      { signal: AbortSignal.timeout(5000) });
+    if (r.ok) { const d = await r.json(); if (d.results?.length) return d.results; }
+  } catch {}
+  // Fallback directo: Nominatim tem CORS aberto para browsers
+  const r2 = await fetch(
+    `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query+' Portugal')}&format=json&limit=5&accept-language=pt&countrycodes=pt`,
+    { headers:{'User-Agent':'CoberturaPT/1.0'} });
+  if (!r2.ok) throw new Error('Geocode failed');
+  return await r2.json();
+}
+
+// Resolução CP — proxy Vercel com fallback directo geoapi.pt
+async function geocodeByPostalCode(cp) {
+  // 1. Proxy Vercel
+  try {
+    const r = await fetch(`${API_MORADAS}?cp=${encodeURIComponent(cp)}`,
+      { signal: AbortSignal.timeout(5000) });
+    if (r.ok) {
+      const d = await r.json();
+      if (d.ok) {
+        const lat = parseFloat(d.latitude || d.Latitude || 0);
+        const lon = parseFloat(d.longitude || d.Longitude || 0);
+        if (lat && lon) return [{ lat, lon, display_name:`${d.rua||''},${d.localidade||''},${cp}`, _geoapi:d }];
+      }
+    }
+  } catch {}
+
+  // 2. geoapi.pt directo
+  const r2 = await fetch(`https://json.geoapi.pt/codigo_postal/${cp}`,
+    { signal: AbortSignal.timeout(6000) });
+  if (!r2.ok) throw new Error('CP não encontrado');
+  const d2 = await r2.json();
+  const lat = parseFloat(d2.latitude || d2.Latitude || 0);
+  const lon = parseFloat(d2.longitude || d2.Longitude || 0);
+  if (!lat || !lon) throw new Error('CP sem coordenadas');
+  return [{ lat, lon, display_name:`${d2.rua||d2.Rua||''},${d2.localidade||d2.Localidade||''},${cp}`, _geoapi:d2 }];
+}
+
+// Reverse geocode — proxy Vercel com múltiplos fallbacks
+async function reverseGeocodeGeoAPI(lat, lon) {
+  // 1. Tenta proxy Vercel
+  try {
+    const r = await fetch(`${API_MORADAS}?lat=${lat}&lon=${lon}`,
+      { signal: AbortSignal.timeout(5000) });
+    if (r.ok) { const d = await r.json(); if (d.ok) return d; }
+  } catch {}
+
+  // 2. geoapi.pt directo (tem CORS aberto)
+  try {
+    const r = await fetch(`https://json.geoapi.pt/gps/${lat},${lon}`,
+      { signal: AbortSignal.timeout(5000) });
+    if (r.ok) { const d = await r.json(); return { ok:true, ...d }; }
+  } catch {}
+
+  // 3. Nominatim directo (tem CORS aberto)
+  try {
+    const r = await fetch(
+      `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json&accept-language=pt`,
+      { headers:{'User-Agent':'CoberturaPT/1.0'}, signal: AbortSignal.timeout(5000) });
+    if (r.ok) {
+      const d = await r.json();
+      return { ok:true, rua: d.address?.road||'', numero_porta: d.address?.house_number||'',
+               localidade: d.address?.city||d.address?.town||d.address?.village||'',
+               codigo_postal: d.address?.postcode||'', distrito:'', concelho:'', freguesia:'' };
+    }
+  } catch {}
+  return null;
 }
 
 async function doSearch() {
@@ -1574,10 +1645,16 @@ async function doSearch() {
       document.getElementById('loading-text').textContent = `A resolver CP ${cp}…`;
 
       try {
-        const r = await fetch(`${API_MORADAS}?cp=${encodeURIComponent(cp)}`, {
-          signal: AbortSignal.timeout(8000)
-        });
-        const d = await r.json();
+        let _cpd = null;
+        try {
+          const _cpr = await fetch(`${API_MORADAS}?cp=${encodeURIComponent(cp)}`,{signal:AbortSignal.timeout(4000)});
+          if (_cpr.ok) { const _tmp = await _cpr.json(); if (_tmp.ok) _cpd = _tmp; }
+        } catch {}
+        if (!_cpd) {
+          const _cpr2 = await fetch(`https://json.geoapi.pt/codigo_postal/${cp}`);
+          if (_cpr2.ok) { const _tmp2 = await _cpr2.json(); _cpd = { ok:true, ..._tmp2, latitude:_tmp2.latitude||_tmp2.Latitude, longitude:_tmp2.longitude||_tmp2.Longitude }; }
+        }
+        const d = _cpd || {};
         if (d.ok && (d.latitude || d.Latitude)) {
           const lat = parseFloat(d.latitude || d.Latitude);
           const lon = parseFloat(d.longitude || d.Longitude);
@@ -1614,7 +1691,13 @@ async function doSearch() {
     await lookupCoverage(lat, lon, top.display_name.split(',').slice(0,3).join(','));
   } catch (e) {
     console.error(e);
-    showError('Erro ao pesquisar. Verifica a ligação e tenta novamente.');
+    console.error('doSearch error:', e);
+    // Only show error if it's not a network issue with the proxy (we have fallbacks)
+    if (e.message && !e.message.includes('Proxy') && !e.message.includes('timeout')) {
+      showError('Morada não encontrada. Tenta: "Rua X, Porto" ou código postal "4000-321".');
+    } else {
+      showError('Sem ligação. Verifica o internet e tenta novamente.');
+    }
   }
 }
 
@@ -1687,14 +1770,20 @@ map.on('click', async function(e) {
       return;
     }
     // Fallback: Nominatim
-    const r = await fetch(`${API_MORADAS}?lat=${lat}&lon=${lng}`);
+    // proxy ou directo
+    const _murl = `${API_MORADAS}?lat=${lat}&lon=${lng}`;
+    let _mok = false;
+    let r;
+    try { r = await fetch(_murl, {signal:AbortSignal.timeout(4000)}); _mok = r.ok; } catch {}
+    if (!_mok) r = await fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&accept-language=pt`,{headers:{'User-Agent':'CoberturaPT/1.0'}});
     const d = await r.json();
-    // Proxy retorna formato geoapi.pt + nominatim merged
     const addr = d.ok
       ? [d.rua, d.localidade, d.codigo_postal].filter(Boolean).join(', ') || `${lat.toFixed(4)}, ${lng.toFixed(4)}`
       : (d.display_name?.split(',').slice(0,3).join(',') || `${lat.toFixed(4)}, ${lng.toFixed(4)}`);
-    document.getElementById('search-input').value = d.ok ? (d.rua || d.localidade || '') : (d.address?.road || d.display_name?.split(',')[0] || '');
-    lastGeoAPIData = d.ok ? d : null;
+    document.getElementById('search-input').value = d.ok
+      ? (d.rua || d.localidade || '')
+      : (d.address?.road || d.display_name?.split(',')[0] || '');
+    lastGeoAPIData = d.ok ? d : (d.address ? {ok:true, rua:d.address.road||'', localidade:d.address.city||d.address.town||'', codigo_postal:d.address.postcode||''} : null);
     await lookupCoverage(lat, lng, addr);
   } catch {
     await lookupCoverage(lat, lng, `${lat.toFixed(5)}, ${lng.toFixed(5)}`);
